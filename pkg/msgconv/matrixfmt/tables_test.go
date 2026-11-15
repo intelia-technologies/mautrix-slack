@@ -242,3 +242,47 @@ func TestCodeBlockSeparatesParagraphsAndItems(t *testing.T) {
 		t.Fatalf("PlainText = %q", got)
 	}
 }
+
+func TestTwoAndFiveTablesFit(t *testing.T) {
+	table := htmlTable(6, 4, func(r, c int) string {
+		return fmt.Sprintf(`<a href="https://example.com/%d/%d">r%dc%d</a>`, r, c, r, c)
+	})
+	for _, n := range []int{2, 5} {
+		var buf strings.Builder
+		for i := range n {
+			fmt.Fprintf(&buf, "<p>Tabla %d</p>%s", i, table)
+		}
+		tables := 0
+		for _, typ := range blockTypes(parseBlocks(t, buf.String())) {
+			if typ == slack.MBTTable {
+				tables++
+			}
+		}
+		if tables != n {
+			t.Fatalf("expected %d native tables, got %d", n, tables)
+		}
+	}
+}
+
+func TestTableLinkURLsCountAgainstLimit(t *testing.T) {
+	// 24 short cells and 20 links of 500 characters: 300 visible characters, 10300 with the URLs.
+	url := "https://example.com/" + strings.Repeat("x", 480)
+	table := htmlTable(6, 4, func(r, c int) string { return fmt.Sprintf(`<a href="%s%d%d">enlace</a>`, url, r, c) })
+	requireCodeBlock(t, parseBlocks(t, table), "enlace ("+url)
+
+	// Without the links, the same table is native.
+	plain := htmlTable(6, 4, func(r, c int) string { return "enlace" })
+	if got := blockTypes(parseBlocks(t, plain)); len(got) != 1 || got[0] != slack.MBTTable {
+		t.Fatalf("the table without links should be native, got %v", got)
+	}
+}
+
+func TestTableURLBudgetIsSharedAcrossMessage(t *testing.T) {
+	// Each table has 20 links of 300 characters: 6000 counting the URLs, so only the first fits.
+	url := "https://example.com/" + strings.Repeat("y", 280)
+	table := htmlTable(6, 4, func(r, c int) string { return fmt.Sprintf(`<a href="%s">l</a>`, url) })
+	blocks := parseBlocks(t, table+"<p>entre</p>"+table)
+	if got := fmt.Sprint(blockTypes(blocks)); got != "[table rich_text]" {
+		t.Fatalf("expected the first table native and the second as code, got %s", got)
+	}
+}

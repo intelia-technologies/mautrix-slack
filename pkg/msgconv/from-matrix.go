@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-slack/pkg/msgconv/matrixfmt"
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
@@ -52,9 +53,35 @@ type ConvertedSlackMessage struct {
 	FileUpload *slack.UploadFileParameters
 	FileShare  *slack.ShareFileParams
 
-	// FallbackSendReq is SendReq with the native tables rendered as code blocks. It is only
-	// set when SendReq has table blocks, to retry the message if Slack rejects them.
-	FallbackSendReq slack.MsgOption
+	// textFallback is the message of SendReq with the tables as code blocks, to resend it
+	// as split text if Slack rejects SendReq (see FallbackSendReqs).
+	textFallback    *slack.RichTextBlock
+	fallbackOptions []slack.MsgOption
+	isEdit          bool
+}
+
+// FallbackSendReqs is the message as text in chunks of at most matrixfmt.MaxSplitChars
+// characters, marked "(1/n)", "(2/n)"…, to send in order if Slack rejects SendReq. It's
+// empty for messages without text, and for an edit that doesn't fit in a single chunk,
+// since a message can't be edited into several.
+func (conv *ConvertedSlackMessage) FallbackSendReqs() []slack.MsgOption {
+	if conv.textFallback == nil {
+		return nil
+	}
+	chunks := matrixfmt.SplitText(conv.textFallback)
+	if conv.isEdit && len(chunks) > 1 {
+		return nil
+	}
+	reqs := make([]slack.MsgOption, len(chunks))
+	for i, chunk := range chunks {
+		opts := []slack.MsgOption{slack.MsgOptionText(chunk, false)}
+		if conv.isEdit {
+			// Clear the blocks of the edited message, or Slack keeps showing them.
+			opts = append(opts, slack.MsgOptionBlocks())
+		}
+		reqs[i] = slack.MsgOptionCompose(append(opts, conv.fallbackOptions...)...)
+	}
+	return reqs
 }
 
 func isTableBlock(block slack.Block) bool {
@@ -109,15 +136,18 @@ func (mc *MessageConverter) ToSlack(
 	case event.MsgText, event.MsgEmote, event.MsgNotice:
 		options := make([]slack.MsgOption, 0, 4)
 		var blocks []slack.Block
-		var fallbackBlock slack.Block
+		var fallback *slack.RichTextBlock
 		if content.Format == event.FormatHTML {
 			blocks = mc.MatrixHTMLParser.ParseBlocks(ctx, content.FormattedBody, content.Mentions, portal)
 			if slices.ContainsFunc(blocks, isTableBlock) {
-				// The same message with the tables as code blocks, in case Slack rejects the tables.
-				fallbackBlock = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+				// The same message with the tables as code blocks, in case Slack rejects it.
+				fallback = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+			} else if len(blocks) == 1 {
+				fallback, _ = blocks[0].(*slack.RichTextBlock)
 			}
 		} else {
-			blocks = []slack.Block{mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal)}
+			fallback = mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal)
+			blocks = []slack.Block{fallback}
 		}
 		if editTargetID != "" {
 			options = append(options, slack.MsgOptionUpdate(editTargetID))
@@ -143,11 +173,12 @@ func (mc *MessageConverter) ToSlack(
 				}
 			}
 		}
-		converted := &ConvertedSlackMessage{SendReq: slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, options...)...)}
-		if fallbackBlock != nil {
-			converted.FallbackSendReq = slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(fallbackBlock)}, options...)...)
-		}
-		return converted, nil
+		return &ConvertedSlackMessage{
+			SendReq:         slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, options...)...),
+			textFallback:    fallback,
+			fallbackOptions: options,
+			isEdit:          editTargetID != "",
+		}, nil
 	case event.MsgAudio, event.MsgFile, event.MsgImage, event.MsgVideo:
 		data, err := mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
 		if err != nil {

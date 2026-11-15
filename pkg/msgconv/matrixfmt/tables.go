@@ -92,7 +92,7 @@ func (parser *HTMLParser) tableToElements(node *html.Node, ctx Context) []slack.
 	for _, row := range rows {
 		columns = max(columns, len(row))
 		for _, cell := range row {
-			chars += utf8.RuneCountInString(cell.text)
+			chars += cell.chars()
 		}
 	}
 	if canBeNative && simple && len(rows) <= MaxTableRows && columns <= MaxTableColumns &&
@@ -113,6 +113,64 @@ func (parser *HTMLParser) tableToElements(node *html.Node, ctx Context) []slack.
 	}
 	return append(captionElems, slack.NewRichTextPreformatted(border, "",
 		slack.NewRichTextSectionTextElement(strings.TrimSuffix(AlignedTable(texts, headerRows), "\n"), nil)))
+}
+
+// chars is what a cell counts against MaxTableChars. Slack counts the URL of links too, not
+// only their text, so rich cells are counted from their elements.
+func (cell tableCell) chars() int {
+	if !cell.rich {
+		return utf8.RuneCountInString(cell.text)
+	}
+	n := sectionChars(cell.section)
+	for _, elem := range cell.elems {
+		n += richTextChars(elem)
+	}
+	return n
+}
+
+func richTextChars(elem slack.RichTextElement) int {
+	switch e := elem.(type) {
+	case *slack.RichTextSection:
+		return sectionChars(e.Elements)
+	case slack.RichTextSection:
+		return sectionChars(e.Elements)
+	case *slack.RichTextQuote:
+		return sectionChars(e.Elements)
+	case *slack.RichTextPreformatted:
+		return sectionChars(e.Elements)
+	case *slack.RichTextList:
+		return listChars(e.Elements)
+	case slack.RichTextList:
+		return listChars(e.Elements)
+	}
+	return 0
+}
+
+func listChars(items []slack.RichTextElement) (n int) {
+	for _, item := range items {
+		n += richTextChars(item)
+	}
+	return
+}
+
+func sectionChars(elems []slack.RichTextSectionElement) (n int) {
+	for _, elem := range elems {
+		switch e := elem.(type) {
+		case *slack.RichTextSectionTextElement:
+			n += utf8.RuneCountInString(e.Text)
+		case *slack.RichTextSectionLinkElement:
+			n += utf8.RuneCountInString(e.URL) + utf8.RuneCountInString(e.Text)
+		case *slack.RichTextSectionUserElement:
+			n += len(e.UserID)
+		case *slack.RichTextSectionChannelElement:
+			n += len(e.ChannelID)
+		case *slack.RichTextSectionEmojiElement:
+			n += utf8.RuneCountInString(e.Name)
+		case *slack.RichTextSectionBroadcastElement:
+			n += len(e.Range)
+		}
+	}
+	return
 }
 
 // readTable collects the rows and the caption of a table. simple is false when the table

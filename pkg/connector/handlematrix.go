@@ -28,6 +28,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-slack/pkg/connector/slackdb"
 	"go.mau.fi/mautrix-slack/pkg/emoji"
@@ -104,9 +105,12 @@ func (s *SlackClient) sendToSlack(
 	if conv.SendReq != nil {
 		log.Debug().Msg("Sending message to Slack")
 		_, timestamp, err := s.Client.PostMessageContext(ctx, channelID, conv.SendReq)
-		if err != nil && conv.FallbackSendReq != nil && isBlocksError(err) {
-			log.Warn().Err(err).Msg("Slack rejected the message with native tables, retrying with the tables as code blocks")
-			_, timestamp, err = s.Client.PostMessageContext(ctx, channelID, conv.FallbackSendReq)
+		var rejection slack.SlackErrorResponse
+		if err != nil && errors.As(err, &rejection) {
+			if reqs := conv.FallbackSendReqs(); len(reqs) > 0 {
+				log.Warn().Err(err).Int("parts", len(reqs)).Msg("Slack rejected the message, resending it as split text")
+				return s.sendSplitText(ctx, channelID, reqs, err)
+			}
 		}
 		return timestamp, err
 	} else if conv.FileUpload != nil {
@@ -147,13 +151,22 @@ func (s *SlackClient) sendToSlack(
 	}
 }
 
-// isBlocksError reports whether Slack rejected a message because of its blocks.
-func isBlocksError(err error) bool {
-	var slackErr slack.SlackErrorResponse
-	if !errors.As(err, &slackErr) {
-		return false
+// sendSplitText sends the parts of a message that Slack rejected, in order, and returns
+// the timestamp of the first one. If Slack rejects the text too, the message fails for good.
+func (s *SlackClient) sendSplitText(ctx context.Context, channelID string, reqs []slack.MsgOption, rejection error) (string, error) {
+	var firstTS string
+	for i, req := range reqs {
+		_, timestamp, err := s.Client.PostMessageContext(ctx, channelID, req)
+		if err != nil {
+			err = fmt.Errorf("slack rejected the message (%w) and part %d/%d of its split text: %w", rejection, i+1, len(reqs), err)
+			zerolog.Ctx(ctx).Err(err).Int("parts_sent", i).Msg("Message failed for good")
+			return "", bridgev2.WrapErrorInStatus(err).WithStatus(event.MessageStatusFail).WithIsCertain(true).WithSendNotice(true)
+		}
+		if i == 0 {
+			firstTS = timestamp
+		}
 	}
-	return strings.HasPrefix(slackErr.Err, "invalid_blocks") || strings.Contains(slackErr.Err, "blocks_too_long") || slackErr.Err == "too_many_blocks"
+	return firstTS, nil
 }
 
 func (s *SlackClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {

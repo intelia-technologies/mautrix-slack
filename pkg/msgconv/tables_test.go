@@ -74,27 +74,32 @@ func TestToSlackNativeTableWithFallback(t *testing.T) {
 	if got := strings.Join(blockTypesOf(t, values.Get("blocks")), ","); got != "rich_text,table,rich_text" {
 		t.Fatalf("unexpected blocks %s", got)
 	}
-	if conv.FallbackSendReq == nil {
-		t.Fatal("expected a fallback request for a message with tables")
+	reqs := conv.FallbackSendReqs()
+	if len(reqs) != 1 {
+		t.Fatalf("expected the message as one text part, got %d", len(reqs))
 	}
-	_, fallback := toSlackValues(t, conv.FallbackSendReq)
-	if got := strings.Join(blockTypesOf(t, fallback.Get("blocks")), ","); got != "rich_text" {
-		t.Fatalf("fallback should be a single rich_text block, got %s", got)
+	_, fallback := toSlackValues(t, reqs[0])
+	if fallback.Has("blocks") {
+		t.Fatalf("the text fallback shouldn't have blocks, got %s", fallback.Get("blocks"))
 	}
-	if !strings.Contains(fallback.Get("blocks"), `\nAstrokube (https://example.com) | 4.500`) {
-		t.Fatalf("fallback should have the aligned table, got %s", fallback.Get("blocks"))
+	if text := fallback.Get("text"); !strings.Contains(text, "\nAstrokube (https://example.com) | 4.500") || !strings.HasPrefix(text, "Antes\n```\n") {
+		t.Fatalf("fallback should have the aligned table as a code block, got %q", text)
 	}
 }
 
-func TestToSlackWithoutTablesHasNoFallback(t *testing.T) {
+func TestToSlackWithoutTablesFallsBackToText(t *testing.T) {
 	mc := &MessageConverter{MatrixHTMLParser: matrixfmt.New2(nil, nil)}
-	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "hola", Format: event.FormatHTML, FormattedBody: "<b>hola</b>"}
+	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "hola", Format: event.FormatHTML, FormattedBody: "<b>hola</b> <a href=\"https://example.com\">web</a>"}
 	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, nil, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conv.FallbackSendReq != nil {
-		t.Fatal("unexpected fallback for a message without tables")
+	reqs := conv.FallbackSendReqs()
+	if len(reqs) != 1 {
+		t.Fatalf("expected one text part, got %d", len(reqs))
+	}
+	if _, values := toSlackValues(t, reqs[0]); values.Get("text") != "*hola* <https://example.com|web>" {
+		t.Fatalf("unexpected fallback text %q", values.Get("text"))
 	}
 	_, values := toSlackValues(t, conv.SendReq)
 	if got := strings.Join(blockTypesOf(t, values.Get("blocks")), ","); got != "rich_text" {
@@ -105,7 +110,7 @@ func TestToSlackWithoutTablesHasNoFallback(t *testing.T) {
 func TestToSlackTableKeepsThreadAndEdit(t *testing.T) {
 	threadRoot := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000100")}
 	conv := convertToSlack(t, threadRoot, nil)
-	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReq} {
+	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReqs()[0]} {
 		_, values := toSlackValues(t, opt)
 		if values.Get("thread_ts") != "1700000000.000100" {
 			t.Fatalf("thread_ts lost: %v", values)
@@ -114,11 +119,25 @@ func TestToSlackTableKeepsThreadAndEdit(t *testing.T) {
 
 	editTarget := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000200")}
 	conv = convertToSlack(t, nil, editTarget)
-	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReq} {
+	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReqs()[0]} {
 		endpoint, values := toSlackValues(t, opt)
 		if !strings.HasSuffix(endpoint, "chat.update") || values.Get("ts") != "1700000000.000200" {
 			t.Fatalf("edit lost: %s %v", endpoint, values)
 		}
+	}
+	if _, values := toSlackValues(t, conv.FallbackSendReqs()[0]); values.Get("blocks") != "[]" {
+		t.Fatalf("the text edit should clear the blocks, got %q", values.Get("blocks"))
+	}
+
+	// A message can't be edited into several: an edit too long for one part has no fallback.
+	mc := &MessageConverter{MatrixHTMLParser: matrixfmt.New2(nil, nil)}
+	long := &event.MessageEventContent{MsgType: event.MsgText, Body: strings.Repeat("palabra ", 600)}
+	conv, err := mc.ToSlack(context.Background(), nil, nil, long, &event.Event{Type: event.EventMessage}, nil, editTarget, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reqs := conv.FallbackSendReqs(); reqs != nil {
+		t.Fatalf("expected no fallback for a long edit, got %d parts", len(reqs))
 	}
 }
 
