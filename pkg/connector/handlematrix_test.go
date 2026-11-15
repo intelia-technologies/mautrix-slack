@@ -21,15 +21,15 @@ import (
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
-// fakeSlack answers chat.postMessage with the given errors in order, then with success and
-// a new timestamp for each message.
+// fakeSlack answers chat.postMessage with the given errors in order ("" is a success), then
+// with success. Each success has a new timestamp, ending in the number of the request.
 func fakeSlack(t *testing.T, errs ...string) (*slack.Client, *[]url.Values) {
 	t.Helper()
 	var sent []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		sent = append(sent, r.PostForm)
-		if len(sent) <= len(errs) {
+		if len(sent) <= len(errs) && errs[len(sent)-1] != "" {
 			_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, errs[len(sent)-1])
 			return
 		}
@@ -59,7 +59,10 @@ const smallTable = `<p>Antes</p><table><tr><th>A</th></tr><tr><td>1</td></tr></t
 
 func TestSendToSlackRetriesWithoutTables(t *testing.T) {
 	client, sent := fakeSlack(t, "invalid_blocks")
-	ts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	if len(otherParts) != 0 {
+		t.Fatalf("a message in one part has no other parts, got %v", otherParts)
+	}
 	if err != nil || ts != "1700000000.000002" {
 		t.Fatalf("expected the retry to succeed, got %q, %v", ts, err)
 	}
@@ -100,9 +103,12 @@ func reportTables() string {
 func TestSendToSlackUnknownRejectionSplitsText(t *testing.T) {
 	client, sent := fakeSlack(t, "foo_unknown")
 	threadRoot := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000100")}
-	ts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), threadRoot), nil)
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), threadRoot), nil)
 	if err != nil || ts != "1700000000.000002" {
 		t.Fatalf("expected the split text to be sent, got %q, %v", ts, err)
+	}
+	if want := len(*sent) - 2; len(otherParts) != want || otherParts[0] != "1700000000.000003" || otherParts[want-1] != fmt.Sprintf("1700000000.%06d", len(*sent)) {
+		t.Fatalf("expected the timestamps of parts 2..n in order, got %v", otherParts)
 	}
 	parts := (*sent)[1:]
 	if len(parts) < 2 {
@@ -138,13 +144,30 @@ func TestSendToSlackUnknownRejectionSplitsText(t *testing.T) {
 
 func TestSendToSlackRejectedTextFailsForGood(t *testing.T) {
 	client, sent := fakeSlack(t, "foo_unknown", "msg_too_long")
-	_, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	if len(otherParts) != 0 {
+		t.Fatalf("no part was sent, got %v", otherParts)
+	}
 	var status bridgev2.MessageStatus
 	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || !status.IsCertain {
 		t.Fatalf("expected a definitive failure, got %#v", err)
 	}
 	if !strings.Contains(err.Error(), "foo_unknown") || !strings.Contains(err.Error(), "msg_too_long") || len(*sent) != 2 {
 		t.Fatalf("expected both rejections in the error after 2 requests, got %d: %v", len(*sent), err)
+	}
+}
+
+func TestSendToSlackPartialSplitTextReturnsSentParts(t *testing.T) {
+	// Parts 1 and 2 go out and part 3 is rejected: the message fails, and the parts sent are
+	// returned so that their echoes from Slack aren't bridged back.
+	client, sent := fakeSlack(t, "foo_unknown", "", "", "msg_too_long")
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), nil), nil)
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || len(*sent) != 4 {
+		t.Fatalf("expected a definitive failure after 4 requests, got %d: %v", len(*sent), err)
+	}
+	if fmt.Sprint(otherParts) != "[1700000000.000002 1700000000.000003]" {
+		t.Fatalf("expected the two parts sent, got %v", otherParts)
 	}
 }
 
@@ -157,7 +180,7 @@ func TestSendToSlackDoesNotResendOnTransportErrors(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	client := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
-	_, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	_, _, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
 	if err == nil || requests != 1 {
 		t.Fatalf("expected one failed request, got %d requests, err %v", requests, err)
 	}

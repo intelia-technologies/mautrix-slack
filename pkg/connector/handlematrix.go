@@ -59,7 +59,8 @@ func (s *SlackClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 	if err != nil {
 		return nil, err
 	}
-	timestamp, err := s.sendToSlack(ctx, channelID, conv, msg)
+	timestamp, otherParts, err := s.sendToSlack(ctx, channelID, conv, msg)
+	s.saveOtherParts(ctx, msg, channelID, otherParts)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +75,32 @@ func (s *SlackClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Mat
 		},
 		StreamOrder: slackid.ParseSlackTimestamp(timestamp).UnixMicro(),
 	}, nil
+}
+
+// saveOtherParts saves the parts of a split message that the response doesn't save, so that
+// their echoes from Slack are ignored instead of bridged back to Matrix as new messages.
+// They have no Matrix event of their own, so they get a deterministic event ID.
+func (s *SlackClient) saveOtherParts(ctx context.Context, msg *bridgev2.MatrixMessage, channelID string, timestamps []string) {
+	if len(timestamps) == 0 {
+		return
+	}
+	br := msg.Portal.Bridge
+	senderID := slackid.MakeUserID(s.TeamID, s.UserID)
+	// The message row needs the ghost row, as bridgev2 ensures before saving a message.
+	_, _ = br.GetGhostByID(ctx, senderID)
+	for _, timestamp := range timestamps {
+		messageID := slackid.MakeMessageID(s.TeamID, channelID, timestamp)
+		err := br.DB.Message.Insert(ctx, &database.Message{
+			ID:        messageID,
+			MXID:      br.Matrix.GenerateDeterministicEventID(msg.Portal.MXID, msg.Portal.PortalKey, messageID, ""),
+			Room:      msg.Portal.PortalKey,
+			SenderID:  senderID,
+			Timestamp: slackid.ParseSlackTimestamp(timestamp),
+		})
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("slack_ts", timestamp).Msg("Failed to save a part of a split message")
+		}
+	}
 }
 
 func newEmptyChan() chan struct{} {
@@ -95,12 +122,15 @@ func (s *SlackClient) waitForFileCreated(ctx context.Context, fileID string) {
 	}
 }
 
+// sendToSlack returns the timestamp of the message. When it was resent as split text, it's
+// the timestamp of the first part, and otherParts has those of the other parts sent; if
+// the split text failed, otherParts has all the parts that were sent.
 func (s *SlackClient) sendToSlack(
 	ctx context.Context,
 	channelID string,
 	conv *msgconv.ConvertedSlackMessage,
 	msg *bridgev2.MatrixMessage,
-) (string, error) {
+) (string, []string, error) {
 	log := zerolog.Ctx(ctx)
 	if conv.SendReq != nil {
 		log.Debug().Msg("Sending message to Slack")
@@ -112,13 +142,13 @@ func (s *SlackClient) sendToSlack(
 				return s.sendSplitText(ctx, channelID, reqs, err)
 			}
 		}
-		return timestamp, err
+		return timestamp, nil, err
 	} else if conv.FileUpload != nil {
 		log.Debug().Msg("Uploading attachment to Slack")
 		file, err := s.Client.UploadFileContext(ctx, *conv.FileUpload)
 		if err != nil {
 			log.Err(err).Msg("Failed to upload attachment to Slack")
-			return "", err
+			return "", nil, err
 		}
 		s.waitForFileCreated(ctx, file.ID)
 		var shareInfo slack.ShareFileInfo
@@ -129,12 +159,12 @@ func (s *SlackClient) sendToSlack(
 			shareInfo = info[0]
 		}
 		if shareInfo.Ts != "" {
-			return shareInfo.Ts, nil
+			return shareInfo.Ts, nil, nil
 		}
 		if msg != nil {
 			msg.AddPendingToSave(nil, networkid.TransactionID(fmt.Sprintf("%s:%s", s.UserID, file.ID)), nil)
 		}
-		return "", nil
+		return "", nil, nil
 	} else if conv.FileShare != nil {
 		for _, fileID := range conv.FileShare.Files {
 			s.waitForFileCreated(ctx, fileID)
@@ -143,30 +173,29 @@ func (s *SlackClient) sendToSlack(
 		resp, err := s.Client.ShareFile(ctx, *conv.FileShare)
 		if err != nil {
 			log.Err(err).Msg("Failed to share attachment to Slack")
-			return "", err
+			return "", nil, err
 		}
-		return resp.FileMsgTS, nil
+		return resp.FileMsgTS, nil, nil
 	} else {
-		return "", errors.New("no message or attachment to send")
+		return "", nil, errors.New("no message or attachment to send")
 	}
 }
 
-// sendSplitText sends the parts of a message that Slack rejected, in order, and returns
-// the timestamp of the first one. If Slack rejects the text too, the message fails for good.
-func (s *SlackClient) sendSplitText(ctx context.Context, channelID string, reqs []slack.MsgOption, rejection error) (string, error) {
-	var firstTS string
+// sendSplitText sends the parts of a message that Slack rejected, in order, and returns the
+// timestamp of the first one and those of the rest. If Slack rejects the text too, the
+// message fails for good, and all the parts sent are returned as otherParts.
+func (s *SlackClient) sendSplitText(ctx context.Context, channelID string, reqs []slack.MsgOption, rejection error) (string, []string, error) {
+	sent := make([]string, 0, len(reqs))
 	for i, req := range reqs {
 		_, timestamp, err := s.Client.PostMessageContext(ctx, channelID, req)
 		if err != nil {
 			err = fmt.Errorf("slack rejected the message (%w) and part %d/%d of its split text: %w", rejection, i+1, len(reqs), err)
 			zerolog.Ctx(ctx).Err(err).Int("parts_sent", i).Msg("Message failed for good")
-			return "", bridgev2.WrapErrorInStatus(err).WithStatus(event.MessageStatusFail).WithIsCertain(true).WithSendNotice(true)
+			return "", sent, bridgev2.WrapErrorInStatus(err).WithStatus(event.MessageStatusFail).WithIsCertain(true).WithSendNotice(true)
 		}
-		if i == 0 {
-			firstTS = timestamp
-		}
+		sent = append(sent, timestamp)
 	}
-	return firstTS, nil
+	return sent[0], sent[1:], nil
 }
 
 func (s *SlackClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
@@ -181,7 +210,7 @@ func (s *SlackClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matrix
 	if err != nil {
 		return err
 	}
-	msg.EditTarget.Metadata.(*slackid.MessageMetadata).LastEditTS, err = s.sendToSlack(ctx, channelID, conv, nil)
+	msg.EditTarget.Metadata.(*slackid.MessageMetadata).LastEditTS, _, err = s.sendToSlack(ctx, channelID, conv, nil)
 	return err
 }
 

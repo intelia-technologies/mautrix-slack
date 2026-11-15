@@ -58,6 +58,8 @@ type ConvertedSlackMessage struct {
 	textFallback    *slack.RichTextBlock
 	fallbackOptions []slack.MsgOption
 	isEdit          bool
+	// broadcast also sends the reply to the channel; only the first part of the split text.
+	broadcast bool
 }
 
 // FallbackSendReqs is the message as text in chunks of at most matrixfmt.MaxSplitChars
@@ -78,6 +80,9 @@ func (conv *ConvertedSlackMessage) FallbackSendReqs() []slack.MsgOption {
 		if conv.isEdit {
 			// Clear the blocks of the edited message, or Slack keeps showing them.
 			opts = append(opts, slack.MsgOptionBlocks())
+		}
+		if i == 0 && conv.broadcast {
+			opts = append(opts, slack.MsgOptionBroadcast())
 		}
 		reqs[i] = slack.MsgOptionCompose(append(opts, conv.fallbackOptions...)...)
 	}
@@ -160,9 +165,6 @@ func (mc *MessageConverter) ToSlack(
 		if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
 			options = append(options, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
 		}
-		if content.BeeperBroadcastOutsideThread {
-			options = append(options, slack.MsgOptionBroadcast())
-		}
 		if origSender != nil {
 			options = append(options, slack.MsgOptionUsername(origSender.FormattedName))
 			urlProvider, ok := mc.Bridge.Matrix.(bridgev2.MatrixConnectorWithPublicMedia)
@@ -173,11 +175,16 @@ func (mc *MessageConverter) ToSlack(
 				}
 			}
 		}
+		sendOptions := options
+		if content.BeeperBroadcastOutsideThread {
+			sendOptions = append(slices.Clip(options), slack.MsgOptionBroadcast())
+		}
 		return &ConvertedSlackMessage{
-			SendReq:         slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, options...)...),
+			SendReq:         slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, sendOptions...)...),
 			textFallback:    fallback,
 			fallbackOptions: options,
 			isEdit:          editTargetID != "",
+			broadcast:       content.BeeperBroadcastOutsideThread,
 		}, nil
 	case event.MsgAudio, event.MsgFile, event.MsgImage, event.MsgVideo:
 		data, err := mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)

@@ -124,7 +124,7 @@ func splitUnit(unit textUnit, limit int) []string {
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		switch {
-		case strings.HasPrefix(strings.TrimSpace(line), codeFence):
+		case opensCodeBlock(line):
 			flushPara()
 			end := i + 1
 			for end < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[end]), codeFence) {
@@ -151,16 +151,20 @@ func splitUnit(unit textUnit, limit int) []string {
 	return pieces
 }
 
+// opensCodeBlock reports whether a line of plain text opens a code block: it starts with a
+// fence that isn't closed on the same line.
+func opensCodeBlock(line string) bool {
+	line = strings.TrimSpace(line)
+	return strings.HasPrefix(line, codeFence) && !strings.Contains(line[len(codeFence):], codeFence)
+}
+
 // splitCodeBlock splits a fenced code block at its lines into complete code blocks of at
 // most limit characters. Only a single line longer than a chunk is cut.
 func splitCodeBlock(code string, limit int) []string {
-	inner := strings.TrimPrefix(code, codeFence)
-	if newline := strings.IndexByte(inner, '\n'); newline >= 0 {
-		// Drop the language after the opening fence.
-		inner = inner[newline+1:]
-	}
-	inner = strings.TrimSuffix(strings.TrimRight(inner, "\n"), codeFence)
-	inner = strings.TrimRight(inner, "\n")
+	// Slack has no language after the fence: text there is part of the code.
+	inner := strings.TrimPrefix(strings.TrimSpace(code), codeFence)
+	inner = strings.TrimPrefix(inner, "\n")
+	inner = strings.TrimRight(strings.TrimSuffix(inner, codeFence), "\n")
 	wrap := len(codeFence+"\n") + len("\n"+codeFence)
 	parts := splitBy(inner, limit-wrap, "\n")
 	for i, part := range parts {

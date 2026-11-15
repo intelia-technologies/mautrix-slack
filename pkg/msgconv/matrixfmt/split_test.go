@@ -84,6 +84,27 @@ func TestSplitPlainTextKeepsFencedCode(t *testing.T) {
 	}
 }
 
+func TestSplitPlainTextOneLineFenceIsNotABlock(t *testing.T) {
+	// A one-line block doesn't open a code block, and text after an opening fence is code.
+	text := "```inline code```\n" + strings.Repeat("Prosa larga. ", 400) + "\n```\nreal\n```\n\n```primera linea\n" +
+		strings.Repeat("codigo\n", 600) + "```"
+	chunks := SplitText(New2(nil, nil).ParseText(context.Background(), text, nil, nil))
+	requireChunkSizes(t, chunks)
+	var all strings.Builder
+	for i := range chunks {
+		body := stripMarker(t, chunks, i)
+		if strings.Count(body, "```")%2 != 0 {
+			t.Fatalf("part %d has unpaired fences: %.80q", i+1, body)
+		}
+		all.WriteString(body)
+	}
+	for _, want := range []string{"```inline code```", "```\nreal\n```", "```\nprimera linea\ncodigo"} {
+		if !strings.Contains(all.String(), want) {
+			t.Fatalf("lost %q", want)
+		}
+	}
+}
+
 func TestSplitCodeBlockLongerThanAPart(t *testing.T) {
 	var lines []string
 	for i := range 400 {
