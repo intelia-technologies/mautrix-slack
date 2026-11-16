@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-slack/pkg/msgconv/matrixfmt"
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
@@ -52,9 +53,49 @@ type ConvertedSlackMessage struct {
 	FileUpload *slack.UploadFileParameters
 	FileShare  *slack.ShareFileParams
 
-	// FallbackSendReq is SendReq with the native tables rendered as code blocks. It is only
-	// set when SendReq has table blocks, to retry the message if Slack rejects them.
-	FallbackSendReq slack.MsgOption
+	// textFallback is the message of SendReq with the tables as code blocks, to resend it
+	// as split text if Slack rejects SendReq (see FallbackParts).
+	textFallback *slack.RichTextBlock
+	// fallbackOptions are the options of SendReq other than the thread, edit and broadcast.
+	fallbackOptions []slack.MsgOption
+	// editTargetTS is the message that an edit updates with the first part.
+	editTargetTS string
+	// threadTS is the thread of the parts: the thread of the message or of the edited
+	// message, or the edited message itself. When empty, the first part starts the thread.
+	threadTS string
+	// broadcast also sends the reply to the channel; only the first part of the split text.
+	broadcast bool
+}
+
+// FallbackParts is the message as text in parts of at most matrixfmt.MaxSplitChars
+// characters, marked "(1/n)", "(2/n)"…, to send in order with FallbackSendReq if Slack
+// rejects SendReq. It's empty for messages without text.
+func (conv *ConvertedSlackMessage) FallbackParts() []string {
+	if conv.textFallback == nil {
+		return nil
+	}
+	return matrixfmt.SplitText(conv.textFallback)
+}
+
+// FallbackSendReq is the request of part i of FallbackParts. firstTS is the timestamp of
+// the first part, sent before: the other parts go in its thread when the message wasn't in
+// one. An edit updates the edited message with the first part and replies to it with the
+// rest, in its thread if it has one.
+func (conv *ConvertedSlackMessage) FallbackSendReq(part string, i int, firstTS string) slack.MsgOption {
+	opts := []slack.MsgOption{slack.MsgOptionText(part, false)}
+	switch {
+	case i == 0 && conv.editTargetTS != "":
+		// Clear the blocks of the edited message, or Slack keeps showing them.
+		opts = append(opts, slack.MsgOptionUpdate(conv.editTargetTS), slack.MsgOptionBlocks())
+	case conv.threadTS != "":
+		opts = append(opts, slack.MsgOptionTS(conv.threadTS))
+	case i > 0:
+		opts = append(opts, slack.MsgOptionTS(firstTS))
+	}
+	if i == 0 && conv.broadcast {
+		opts = append(opts, slack.MsgOptionBroadcast())
+	}
+	return slack.MsgOptionCompose(append(opts, conv.fallbackOptions...)...)
 }
 
 func isTableBlock(block slack.Block) bool {
@@ -79,7 +120,7 @@ func (mc *MessageConverter) ToSlack(
 		content.MsgType = event.MsgImage
 	}
 
-	var editTargetID, threadRootID string
+	var editTargetID, editThreadID, threadRootID string
 	if editTarget != nil {
 		if isMediaMsgtype(content.MsgType) {
 			content.MsgType = event.MsgText
@@ -91,6 +132,12 @@ func (mc *MessageConverter) ToSlack(
 		_, _, editTargetID, ok = slackid.ParseMessageID(editTarget.ID)
 		if !ok {
 			return nil, fmt.Errorf("failed to parse edit target ID")
+		}
+		editThreadID = editTargetID
+		if editTarget.ThreadRoot != "" {
+			if _, _, root, ok := slackid.ParseMessageID(editTarget.ThreadRoot); ok {
+				editThreadID = root
+			}
 		}
 	}
 	if threadRoot != nil {
@@ -109,29 +156,30 @@ func (mc *MessageConverter) ToSlack(
 	case event.MsgText, event.MsgEmote, event.MsgNotice:
 		options := make([]slack.MsgOption, 0, 4)
 		var blocks []slack.Block
-		var fallbackBlock slack.Block
+		var fallback *slack.RichTextBlock
 		if content.Format == event.FormatHTML {
 			blocks = mc.MatrixHTMLParser.ParseBlocks(ctx, content.FormattedBody, content.Mentions, portal)
 			if slices.ContainsFunc(blocks, isTableBlock) {
-				// The same message with the tables as code blocks, in case Slack rejects the tables.
-				fallbackBlock = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+				// The same message with the tables as code blocks, in case Slack rejects it.
+				fallback = mc.MatrixHTMLParser.Parse(ctx, content.FormattedBody, content.Mentions, portal)
+			} else if len(blocks) == 1 {
+				fallback, _ = blocks[0].(*slack.RichTextBlock)
 			}
 		} else {
-			blocks = []slack.Block{mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal)}
+			fallback = mc.MatrixHTMLParser.ParseText(ctx, content.Body, content.Mentions, portal)
+			blocks = []slack.Block{fallback}
 		}
+		var threadOption []slack.MsgOption
 		if editTargetID != "" {
-			options = append(options, slack.MsgOptionUpdate(editTargetID))
+			threadOption = []slack.MsgOption{slack.MsgOptionUpdate(editTargetID)}
 		} else if threadRootID != "" {
-			options = append(options, slack.MsgOptionTS(threadRootID))
+			threadOption = []slack.MsgOption{slack.MsgOptionTS(threadRootID)}
 		}
 		if content.MsgType == event.MsgEmote {
 			options = append(options, slack.MsgOptionMeMessage())
 		}
 		if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
 			options = append(options, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
-		}
-		if content.BeeperBroadcastOutsideThread {
-			options = append(options, slack.MsgOptionBroadcast())
 		}
 		if origSender != nil {
 			options = append(options, slack.MsgOptionUsername(origSender.FormattedName))
@@ -143,9 +191,20 @@ func (mc *MessageConverter) ToSlack(
 				}
 			}
 		}
-		converted := &ConvertedSlackMessage{SendReq: slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, options...)...)}
-		if fallbackBlock != nil {
-			converted.FallbackSendReq = slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(fallbackBlock)}, options...)...)
+		sendOptions := append(threadOption, options...)
+		if content.BeeperBroadcastOutsideThread {
+			sendOptions = append(sendOptions, slack.MsgOptionBroadcast())
+		}
+		converted := &ConvertedSlackMessage{
+			SendReq:         slack.MsgOptionCompose(append([]slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, sendOptions...)...),
+			textFallback:    fallback,
+			fallbackOptions: options,
+			editTargetTS:    editTargetID,
+			threadTS:        threadRootID,
+			broadcast:       content.BeeperBroadcastOutsideThread,
+		}
+		if editTargetID != "" {
+			converted.threadTS = editThreadID
 		}
 		return converted, nil
 	case event.MsgAudio, event.MsgFile, event.MsgImage, event.MsgVideo:

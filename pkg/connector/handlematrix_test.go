@@ -6,84 +6,274 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-slack/pkg/msgconv"
 	"go.mau.fi/mautrix-slack/pkg/msgconv/matrixfmt"
+	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
-func TestIsBlocksError(t *testing.T) {
-	for _, tc := range []struct {
-		err  error
-		want bool
-	}{
-		{slack.SlackErrorResponse{Err: "invalid_blocks"}, true},
-		{slack.SlackErrorResponse{Err: "invalid_blocks_format"}, true},
-		{fmt.Errorf("wrapped: %w", slack.SlackErrorResponse{Err: "msg_blocks_too_long"}), true},
-		{slack.SlackErrorResponse{Err: "channel_not_found"}, false},
-		{errors.New("invalid_blocks"), false},
-	} {
-		if got := isBlocksError(tc.err); got != tc.want {
-			t.Errorf("isBlocksError(%v) = %v, want %v", tc.err, got, tc.want)
-		}
-	}
-}
-
-// fakeSlack answers chat.postMessage with the given errors in order, then with success.
-func fakeSlack(t *testing.T, errs ...string) (*slack.Client, *[]string) {
+// fakeSlack answers each request with the given errors in order ("" is a success), then
+// with success. Each success has a new timestamp, ending in the number of the request. The
+// method of each request is recorded as "_method" in its form.
+func fakeSlack(t *testing.T, errs ...string) (*slack.Client, *[]url.Values) {
 	t.Helper()
-	var sentBlocks []string
+	var sent []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		sentBlocks = append(sentBlocks, r.PostForm.Get("blocks"))
-		if len(sentBlocks) <= len(errs) {
-			_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, errs[len(sentBlocks)-1])
+		form := r.PostForm
+		form.Set("_method", strings.TrimPrefix(r.URL.Path, "/"))
+		sent = append(sent, form)
+		if len(sent) <= len(errs) && errs[len(sent)-1] != "" {
+			_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, errs[len(sent)-1])
 			return
 		}
-		_, _ = w.Write([]byte(`{"ok":true,"channel":"C1","ts":"1700000000.000300"}`))
+		_, _ = fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"1700000000.%06d"}`, len(sent))
 	}))
 	t.Cleanup(srv.Close)
-	return slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), &sentBlocks
+	return slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), &sent
 }
 
-func tableMessage(t *testing.T) *msgconv.ConvertedSlackMessage {
+func convert(t *testing.T, formattedBody string, threadRoot *database.Message) *msgconv.ConvertedSlackMessage {
+	t.Helper()
+	return convertMessage(t, formattedBody, threadRoot, nil)
+}
+
+func convertMessage(t *testing.T, formattedBody string, threadRoot, editTarget *database.Message) *msgconv.ConvertedSlackMessage {
 	t.Helper()
 	mc := &msgconv.MessageConverter{MatrixHTMLParser: matrixfmt.New2(nil, nil)}
 	content := &event.MessageEventContent{
 		MsgType:       event.MsgText,
-		Body:          "tabla",
+		Body:          "mensaje",
 		Format:        event.FormatHTML,
-		FormattedBody: `<p>Antes</p><table><tr><th>A</th></tr><tr><td>1</td></tr></table>`,
+		FormattedBody: formattedBody,
 	}
-	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, nil, nil, nil, false)
+	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, threadRoot, editTarget, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return conv
 }
 
-func TestSendToSlackRetriesWithoutTables(t *testing.T) {
-	client, sent := fakeSlack(t, "invalid_blocks")
-	ts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", tableMessage(t), nil)
-	if err != nil || ts != "1700000000.000300" {
-		t.Fatalf("expected the retry to succeed, got %q, %v", ts, err)
+func TestSendToSlackSplitTextStartsAThread(t *testing.T) {
+	// A message that wasn't a reply: the first part goes to the channel and the rest reply to it.
+	client, sent := fakeSlack(t, "foo_unknown")
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), nil), nil)
+	if err != nil || ts != "1700000000.000002" || len(otherParts) != len(*sent)-2 {
+		t.Fatalf("expected the split text to be sent, got %q, %v, %v", ts, otherParts, err)
 	}
-	if len(*sent) != 2 || !strings.Contains((*sent)[0], `"type":"table"`) || strings.Contains((*sent)[1], `"type":"table"`) {
-		t.Fatalf("expected a native table first and a retry without it, got %q", *sent)
+	parts := (*sent)[1:]
+	if parts[0].Has("thread_ts") {
+		t.Fatalf("the first part should start the thread, got thread_ts %q", parts[0].Get("thread_ts"))
 	}
-	if !strings.Contains((*sent)[1], `"type":"rich_text_preformatted"`) {
-		t.Fatalf("retry should carry the table as a code block, got %s", (*sent)[1])
+	for i, part := range parts[1:] {
+		if part.Get("thread_ts") != ts {
+			t.Fatalf("part %d should reply to the first part %s, got thread_ts %q", i+2, ts, part.Get("thread_ts"))
+		}
 	}
 }
 
-func TestSendToSlackDoesNotRetryOtherErrors(t *testing.T) {
-	client, sent := fakeSlack(t, "channel_not_found")
-	_, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", tableMessage(t), nil)
-	if err == nil || len(*sent) != 1 {
-		t.Fatalf("expected one failed request, got %d requests, err %v", len(*sent), err)
+func TestSendToSlackLongEditSplitsText(t *testing.T) {
+	// An edit that Slack rejects and doesn't fit in a part: the edited message gets the first
+	// part and the rest reply to it, so nothing of the new content is lost.
+	client, sent := fakeSlack(t, "foo_unknown")
+	editTarget := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000200")}
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convertMessage(t, reportTables(), nil, editTarget), nil)
+	if err != nil || ts != "1700000000.000002" {
+		t.Fatalf("expected the split edit to be sent, got %q, %v", ts, err)
+	}
+	parts := (*sent)[1:]
+	if len(parts) < 2 || len(otherParts) != len(parts)-1 {
+		t.Fatalf("expected several parts, got %d and %v", len(parts), otherParts)
+	}
+	first := parts[0]
+	if first.Get("_method") != "chat.update" || first.Get("ts") != "1700000000.000200" || first.Get("blocks") != "[]" ||
+		!strings.HasPrefix(first.Get("text"), fmt.Sprintf("(1/%d)\n", len(parts))) {
+		t.Fatalf("the first part should update the edited message, got %v", first)
+	}
+	for i, part := range parts[1:] {
+		if part.Get("_method") != "chat.postMessage" || part.Get("thread_ts") != "1700000000.000200" || part.Has("ts") {
+			t.Fatalf("part %d should reply to the edited message, got %v", i+2, part)
+		}
+	}
+}
+
+func TestSendToSlackLongCodeBlockIsSentInFragments(t *testing.T) {
+	// A code block of about 8,000 characters goes out in complete code blocks of whole lines.
+	client, sent := fakeSlack(t, "foo_unknown")
+	code := strings.TrimSuffix(strings.Repeat("una linea de codigo de prueba\n", 270), "\n")
+	html := "<p>Antes</p><pre><code>" + code + "</code></pre>"
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, html, nil), nil)
+	parts := (*sent)[1:]
+	if err != nil || len(parts) < 3 || len(otherParts) != len(parts)-1 {
+		t.Fatalf("expected the code sent in several parts, got %d, %v", len(parts), err)
+	}
+	var fragments []string
+	for i, part := range parts {
+		text := part.Get("text")
+		if n := utf8.RuneCountInString(text); n > matrixfmt.MaxSplitChars {
+			t.Fatalf("part %d has %d characters", i+1, n)
+		}
+		for _, block := range strings.Split(text, "```")[1:] {
+			if block = strings.Trim(block, "\n"); block != "" {
+				fragments = append(fragments, block)
+			}
+		}
+		if strings.Count(text, "```")%2 != 0 {
+			t.Fatalf("part %d leaves a code block open", i+1)
+		}
+	}
+	if strings.Join(fragments, "\n") != code {
+		t.Fatal("joining the fragments doesn't give back the code")
+	}
+}
+
+const smallTable = `<p>Antes</p><table><tr><th>A</th></tr><tr><td>1</td></tr></table>`
+
+func TestSendToSlackRetriesWithoutTables(t *testing.T) {
+	client, sent := fakeSlack(t, "invalid_blocks")
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	if len(otherParts) != 0 {
+		t.Fatalf("a message in one part has no other parts, got %v", otherParts)
+	}
+	if err != nil || ts != "1700000000.000002" {
+		t.Fatalf("expected the retry to succeed, got %q, %v", ts, err)
+	}
+	if len(*sent) != 2 || !strings.Contains((*sent)[0].Get("blocks"), `"type":"table"`) || (*sent)[1].Has("blocks") {
+		t.Fatalf("expected a native table first and a retry as text, got %v", *sent)
+	}
+	if text := (*sent)[1].Get("text"); text != "Antes\n```\nA\n-\n1\n```" {
+		t.Fatalf("retry should carry the table as a code block, got %q", text)
+	}
+}
+
+// reportTables is the message that Slack rejected in SF-2316: five 6x4 tables with 40 links
+// of 240 characters, between paragraphs.
+func reportTables() string {
+	var buf strings.Builder
+	link := 0
+	for table := range 5 {
+		fmt.Fprintf(&buf, "<h3>Sección %d</h3><p>%s</p><table><tr><th>Tarea</th><th>Estado</th><th>PR</th><th>Notas</th></tr>",
+			table, strings.Repeat("Texto del informe. ", 40))
+		for row := range 5 {
+			fmt.Fprintf(&buf, "<tr><td>OPSF-%d</td><td>hecha</td>", table*10+row)
+			for range 2 {
+				if link < 40 {
+					target := fmt.Sprintf("https://example.com/%03d/", link) + strings.Repeat("x", 240-len("https://example.com/000/"))
+					fmt.Fprintf(&buf, `<td><a href="%s">enlace %d</a></td>`, target, link)
+					link++
+				} else {
+					buf.WriteString("<td>-</td>")
+				}
+			}
+			buf.WriteString("</tr>")
+		}
+		buf.WriteString("</table>")
+	}
+	return buf.String()
+}
+
+func TestSendToSlackUnknownRejectionSplitsText(t *testing.T) {
+	client, sent := fakeSlack(t, "foo_unknown")
+	threadRoot := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000100")}
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), threadRoot), nil)
+	if err != nil || ts != "1700000000.000002" {
+		t.Fatalf("expected the split text to be sent, got %q, %v", ts, err)
+	}
+	if want := len(*sent) - 2; len(otherParts) != want || otherParts[0] != "1700000000.000003" || otherParts[want-1] != fmt.Sprintf("1700000000.%06d", len(*sent)) {
+		t.Fatalf("expected the timestamps of parts 2..n in order, got %v", otherParts)
+	}
+	parts := (*sent)[1:]
+	if len(parts) < 2 {
+		t.Fatalf("expected the message split in several parts, got %d", len(parts))
+	}
+	var all strings.Builder
+	for i, part := range parts {
+		text := part.Get("text")
+		if n := utf8.RuneCountInString(text); n > matrixfmt.MaxSplitChars {
+			t.Errorf("part %d has %d characters", i+1, n)
+		}
+		if marker := fmt.Sprintf("(%d/%d)\n", i+1, len(parts)); !strings.HasPrefix(text, marker) {
+			t.Errorf("part %d doesn't start with %q: %.40q", i+1, marker, text)
+		}
+		if part.Get("thread_ts") != "1700000000.000100" || part.Has("blocks") {
+			t.Errorf("part %d should be text in the same thread, got %v", i+1, part)
+		}
+		if strings.Count(text, "```")%2 != 0 {
+			t.Errorf("part %d cuts a code block", i+1)
+		}
+		all.WriteString(strings.TrimPrefix(text, fmt.Sprintf("(%d/%d)\n", i+1, len(parts))))
+	}
+	// Every link, in order.
+	last := -1
+	for link := range 40 {
+		at := strings.Index(all.String(), fmt.Sprintf("https://example.com/%03d/", link))
+		if at <= last {
+			t.Fatalf("link %d missing or out of order", link)
+		}
+		last = at
+	}
+}
+
+func TestSendToSlackRejectedTextFailsForGood(t *testing.T) {
+	client, sent := fakeSlack(t, "foo_unknown", "msg_too_long")
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	if len(otherParts) != 0 {
+		t.Fatalf("no part was sent, got %v", otherParts)
+	}
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || !status.IsCertain {
+		t.Fatalf("expected a definitive failure, got %#v", err)
+	}
+	if !strings.Contains(err.Error(), "foo_unknown") || !strings.Contains(err.Error(), "msg_too_long") || len(*sent) != 2 {
+		t.Fatalf("expected both rejections in the error after 2 requests, got %d: %v", len(*sent), err)
+	}
+}
+
+func TestSendToSlackPartialSplitTextReturnsSentParts(t *testing.T) {
+	// Parts 1 and 2 go out and part 3 is rejected: the message fails, and the parts sent are
+	// returned so that their echoes from Slack aren't bridged back.
+	client, sent := fakeSlack(t, "foo_unknown", "", "", "msg_too_long")
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), nil), nil)
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || len(*sent) != 4 {
+		t.Fatalf("expected a definitive failure after 4 requests, got %d: %v", len(*sent), err)
+	}
+	if fmt.Sprint(otherParts) != "[1700000000.000002 1700000000.000003]" {
+		t.Fatalf("expected the two parts sent, got %v", otherParts)
+	}
+}
+
+func TestSendToSlackDoesNotResendOnTransportErrors(t *testing.T) {
+	// A failure that isn't Slack rejecting the message may have been posted: don't repeat it.
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+	client := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	_, _, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, smallTable, nil), nil)
+	if err == nil || requests != 1 {
+		t.Fatalf("expected one failed request, got %d requests, err %v", requests, err)
+	}
+}
+
+func TestRecoverSplitTurnsPanicIntoDefinitiveFailure(t *testing.T) {
+	parts, err := recoverSplit(func() []string { panic("slice bounds out of range") })
+	if err == nil || parts != nil || !strings.Contains(err.Error(), "slice bounds") {
+		t.Fatalf("expected the panic as an error, got %v, %v", parts, err)
+	}
+	var status bridgev2.MessageStatus
+	if !errors.As(definitiveFailure(err), &status) || status.Status != event.MessageStatusFail {
+		t.Fatalf("expected a definitive failure, got %#v", definitiveFailure(err))
 	}
 }

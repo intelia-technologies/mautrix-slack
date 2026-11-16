@@ -74,27 +74,32 @@ func TestToSlackNativeTableWithFallback(t *testing.T) {
 	if got := strings.Join(blockTypesOf(t, values.Get("blocks")), ","); got != "rich_text,table,rich_text" {
 		t.Fatalf("unexpected blocks %s", got)
 	}
-	if conv.FallbackSendReq == nil {
-		t.Fatal("expected a fallback request for a message with tables")
+	parts := fallbackParts(t, conv)
+	if len(parts) != 1 {
+		t.Fatalf("expected the message as one text part, got %d", len(parts))
 	}
-	_, fallback := toSlackValues(t, conv.FallbackSendReq)
-	if got := strings.Join(blockTypesOf(t, fallback.Get("blocks")), ","); got != "rich_text" {
-		t.Fatalf("fallback should be a single rich_text block, got %s", got)
+	_, fallback := toSlackValues(t, conv.FallbackSendReq(parts[0], 0, ""))
+	if fallback.Has("blocks") {
+		t.Fatalf("the text fallback shouldn't have blocks, got %s", fallback.Get("blocks"))
 	}
-	if !strings.Contains(fallback.Get("blocks"), `\nAstrokube (https://example.com) | 4.500`) {
-		t.Fatalf("fallback should have the aligned table, got %s", fallback.Get("blocks"))
+	if text := fallback.Get("text"); !strings.Contains(text, "\nAstrokube (https://example.com) | 4.500") || !strings.HasPrefix(text, "Antes\n```\n") {
+		t.Fatalf("fallback should have the aligned table as a code block, got %q", text)
 	}
 }
 
-func TestToSlackWithoutTablesHasNoFallback(t *testing.T) {
+func TestToSlackWithoutTablesFallsBackToText(t *testing.T) {
 	mc := &MessageConverter{MatrixHTMLParser: matrixfmt.New2(nil, nil)}
-	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "hola", Format: event.FormatHTML, FormattedBody: "<b>hola</b>"}
+	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "hola", Format: event.FormatHTML, FormattedBody: "<b>hola</b> <a href=\"https://example.com\">web</a>"}
 	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, nil, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conv.FallbackSendReq != nil {
-		t.Fatal("unexpected fallback for a message without tables")
+	parts := fallbackParts(t, conv)
+	if len(parts) != 1 {
+		t.Fatalf("expected one text part, got %d", len(parts))
+	}
+	if _, values := toSlackValues(t, conv.FallbackSendReq(parts[0], 0, "")); values.Get("text") != "*hola* <https://example.com|web>" {
+		t.Fatalf("unexpected fallback text %q", values.Get("text"))
 	}
 	_, values := toSlackValues(t, conv.SendReq)
 	if got := strings.Join(blockTypesOf(t, values.Get("blocks")), ","); got != "rich_text" {
@@ -102,24 +107,48 @@ func TestToSlackWithoutTablesHasNoFallback(t *testing.T) {
 	}
 }
 
-func TestToSlackTableKeepsThreadAndEdit(t *testing.T) {
-	threadRoot := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000100")}
-	conv := convertToSlack(t, threadRoot, nil)
-	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReq} {
-		_, values := toSlackValues(t, opt)
-		if values.Get("thread_ts") != "1700000000.000100" {
-			t.Fatalf("thread_ts lost: %v", values)
+func fallbackParts(t *testing.T, conv *ConvertedSlackMessage) []string {
+	t.Helper()
+	return conv.FallbackParts()
+}
+
+func TestToSlackFallbackThreadsAndEdits(t *testing.T) {
+	const firstTS = "1700000000.000900"
+	check := func(name string, opt slack.MsgOption, wantEndpoint, wantTS, wantThread string) {
+		t.Helper()
+		endpoint, values := toSlackValues(t, opt)
+		if !strings.HasSuffix(endpoint, wantEndpoint) || values.Get("ts") != wantTS || values.Get("thread_ts") != wantThread {
+			t.Fatalf("%s: got %s ts=%q thread_ts=%q, want %s ts=%q thread_ts=%q",
+				name, endpoint, values.Get("ts"), values.Get("thread_ts"), wantEndpoint, wantTS, wantThread)
 		}
 	}
 
+	// A reply: every part in its thread.
+	threadRoot := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000100")}
+	conv := convertToSlack(t, threadRoot, nil)
+	check("reply SendReq", conv.SendReq, "chat.postMessage", "", "1700000000.000100")
+	check("reply part 1", conv.FallbackSendReq("a", 0, ""), "chat.postMessage", "", "1700000000.000100")
+	check("reply part 2", conv.FallbackSendReq("b", 1, firstTS), "chat.postMessage", "", "1700000000.000100")
+
+	// Not a reply: the first part starts the thread of the rest.
+	conv = convertToSlack(t, nil, nil)
+	check("root part 1", conv.FallbackSendReq("a", 0, ""), "chat.postMessage", "", "")
+	check("root part 2", conv.FallbackSendReq("b", 1, firstTS), "chat.postMessage", "", firstTS)
+
+	// An edit updates the edited message with the first part and replies to it with the rest.
 	editTarget := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000200")}
 	conv = convertToSlack(t, nil, editTarget)
-	for _, opt := range []slack.MsgOption{conv.SendReq, conv.FallbackSendReq} {
-		endpoint, values := toSlackValues(t, opt)
-		if !strings.HasSuffix(endpoint, "chat.update") || values.Get("ts") != "1700000000.000200" {
-			t.Fatalf("edit lost: %s %v", endpoint, values)
-		}
+	check("edit SendReq", conv.SendReq, "chat.update", "1700000000.000200", "")
+	check("edit part 1", conv.FallbackSendReq("a", 0, ""), "chat.update", "1700000000.000200", "")
+	check("edit part 2", conv.FallbackSendReq("b", 1, "1700000000.000200"), "chat.postMessage", "", "1700000000.000200")
+	if _, values := toSlackValues(t, conv.FallbackSendReq("a", 0, "")); values.Get("blocks") != "[]" {
+		t.Fatalf("the text edit should clear the blocks, got %q", values.Get("blocks"))
 	}
+
+	// The edit of a reply: the rest go to the thread of the edited message.
+	editTarget.ThreadRoot = slackid.MakeMessageID("T1", "C1", "1700000000.000100")
+	conv = convertToSlack(t, nil, editTarget)
+	check("thread edit part 2", conv.FallbackSendReq("b", 1, "1700000000.000200"), "chat.postMessage", "", "1700000000.000100")
 }
 
 // A message as Slack sends it: text, a table with every cell type, more text and a second table.
