@@ -106,17 +106,33 @@ func TestSendToSlackLongEditSplitsText(t *testing.T) {
 	}
 }
 
-func TestSendToSlackCodeBlockTooLongFailsForGood(t *testing.T) {
-	// A code block of 4,000 characters doesn't fit in a part and isn't cut: the message fails.
+func TestSendToSlackLongCodeBlockIsSentInFragments(t *testing.T) {
+	// A code block of about 8,000 characters goes out in complete code blocks of whole lines.
 	client, sent := fakeSlack(t, "foo_unknown")
-	html := "<p>Antes</p><pre><code>" + strings.Repeat("x", 4000) + "</code></pre>"
+	code := strings.TrimSuffix(strings.Repeat("una linea de codigo de prueba\n", 270), "\n")
+	html := "<p>Antes</p><pre><code>" + code + "</code></pre>"
 	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, html, nil), nil)
-	var status bridgev2.MessageStatus
-	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || !errors.Is(err, matrixfmt.ErrCodeBlockTooLong) {
-		t.Fatalf("expected a definitive failure for the code block, got %v", err)
+	parts := (*sent)[1:]
+	if err != nil || len(parts) < 3 || len(otherParts) != len(parts)-1 {
+		t.Fatalf("expected the code sent in several parts, got %d, %v", len(parts), err)
 	}
-	if !strings.Contains(err.Error(), "foo_unknown") || len(*sent) != 1 || len(otherParts) != 0 {
-		t.Fatalf("expected no text sent after the rejection, got %d requests, %v", len(*sent), err)
+	var fragments []string
+	for i, part := range parts {
+		text := part.Get("text")
+		if n := utf8.RuneCountInString(text); n > matrixfmt.MaxSplitChars {
+			t.Fatalf("part %d has %d characters", i+1, n)
+		}
+		for _, block := range strings.Split(text, "```")[1:] {
+			if block = strings.Trim(block, "\n"); block != "" {
+				fragments = append(fragments, block)
+			}
+		}
+		if strings.Count(text, "```")%2 != 0 {
+			t.Fatalf("part %d leaves a code block open", i+1)
+		}
+	}
+	if strings.Join(fragments, "\n") != code {
+		t.Fatal("joining the fragments doesn't give back the code")
 	}
 }
 

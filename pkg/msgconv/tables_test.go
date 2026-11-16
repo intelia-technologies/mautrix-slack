@@ -109,11 +109,7 @@ func TestToSlackWithoutTablesFallsBackToText(t *testing.T) {
 
 func fallbackParts(t *testing.T, conv *ConvertedSlackMessage) []string {
 	t.Helper()
-	parts, err := conv.FallbackParts()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return parts
+	return conv.FallbackParts()
 }
 
 func TestToSlackFallbackThreadsAndEdits(t *testing.T) {

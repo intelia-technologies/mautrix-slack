@@ -17,8 +17,8 @@
 package matrixfmt
 
 import (
-	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -33,25 +33,21 @@ const MaxSplitChars = 3500
 // codeFence opens and closes a code block in Slack mrkdwn.
 const codeFence = "```"
 
-// ErrCodeBlockTooLong is returned by SplitText when a code block doesn't fit in a single
-// part: code blocks are never cut, so the message can't be sent as split text.
-var ErrCodeBlockTooLong = errors.New("a code block is longer than a message part")
-
 // SplitText renders a rich text block as Slack mrkdwn text in chunks of at most
 // MaxSplitChars characters, marked "(1/n)", "(2/n)"… when there's more than one.
-func SplitText(block *slack.RichTextBlock) ([]string, error) {
+func SplitText(block *slack.RichTextBlock) []string {
 	return splitText(block, MaxSplitChars)
 }
 
 // textUnit is a paragraph, list, quote or code block of the split text. Chunks only break
 // between units; a unit longer than a chunk is split at its paragraphs, lines and words,
-// but a code block is never split.
+// and a code block longer than a chunk at its lines into several complete code blocks.
 type textUnit struct {
 	text string
 	code bool
 }
 
-func splitText(block *slack.RichTextBlock, limit int) ([]string, error) {
+func splitText(block *slack.RichTextBlock, limit int) []string {
 	var units []textUnit
 	for _, elem := range block.Elements {
 		if unit := renderUnit(elem); strings.TrimSpace(unit.text) != "" {
@@ -59,25 +55,22 @@ func splitText(block *slack.RichTextBlock, limit int) ([]string, error) {
 		}
 	}
 	// A message that fits in one part goes without a marker.
-	if chunks, err := packUnits(units, limit); err == nil && len(chunks) <= 1 {
-		return chunks, nil
+	if chunks := packUnits(units, limit); len(chunks) <= 1 {
+		return chunks
 	}
 	for digits := 1; ; digits++ {
 		// Room for the "(i/n)\n" marker with n of this many digits.
-		chunks, err := packUnits(units, limit-len("(/)\n")-2*digits)
-		if err != nil {
-			return nil, err
-		}
+		chunks := packUnits(units, limit-len("(/)\n")-2*digits)
 		if len(strconv.Itoa(len(chunks))) <= digits {
 			for i, chunk := range chunks {
 				chunks[i] = fmt.Sprintf("(%d/%d)\n%s", i+1, len(chunks), chunk)
 			}
-			return chunks, nil
+			return chunks
 		}
 	}
 }
 
-func packUnits(units []textUnit, limit int) ([]string, error) {
+func packUnits(units []textUnit, limit int) []string {
 	var chunks []string
 	var cur strings.Builder
 	curLen := 0
@@ -105,24 +98,20 @@ func packUnits(units []textUnit, limit int) ([]string, error) {
 			add(unit.text)
 			continue
 		}
-		pieces, err := splitUnit(unit, limit)
-		if err != nil {
-			return nil, err
-		}
-		for _, piece := range pieces {
+		for _, piece := range splitUnit(unit, limit) {
 			add(piece)
 		}
 	}
 	flush()
-	return chunks, nil
+	return chunks
 }
 
 // splitUnit splits a unit longer than limit into pieces of at most limit characters.
-func splitUnit(unit textUnit, limit int) ([]string, error) {
+func splitUnit(unit textUnit, limit int) []string {
 	if unit.code {
-		return nil, ErrCodeBlockTooLong
+		return splitCodeBlock(unit.text, limit)
 	}
-	// Plain text may carry its own code blocks between fences: keep them whole too.
+	// Plain text may carry its own code blocks between fences: they're split like code too.
 	var pieces []string
 	var para []string
 	flushPara := func() {
@@ -146,9 +135,10 @@ func splitUnit(unit textUnit, limit int) ([]string, error) {
 			end = min(end, len(lines)-1)
 			code := strings.Join(lines[i:end+1], "\n")
 			if utf8.RuneCountInString(code) > limit {
-				return nil, ErrCodeBlockTooLong
+				pieces = append(pieces, splitCodeBlock(code, limit)...)
+			} else {
+				pieces = append(pieces, code)
 			}
-			pieces = append(pieces, code)
 			i = end
 		case strings.TrimSpace(line) == "":
 			flushPara()
@@ -160,7 +150,7 @@ func splitUnit(unit textUnit, limit int) ([]string, error) {
 	if len(pieces) > 0 {
 		pieces[len(pieces)-1] = strings.TrimRight(pieces[len(pieces)-1], "\n")
 	}
-	return pieces, nil
+	return pieces
 }
 
 // opensCodeBlock reports whether a line of plain text opens a code block: it starts with a
@@ -168,6 +158,33 @@ func splitUnit(unit textUnit, limit int) ([]string, error) {
 func opensCodeBlock(line string) bool {
 	line = strings.TrimSpace(line)
 	return strings.HasPrefix(line, codeFence) && !strings.Contains(line[len(codeFence):], codeFence)
+}
+
+// codeLanguageRegex matches a language tag after an opening fence ("```go").
+var codeLanguageRegex = regexp.MustCompile(`^[A-Za-z0-9_+#.-]+$`)
+
+// splitCodeBlock splits a fenced code block longer than limit at its lines into several
+// complete code blocks of at most limit characters, each with its own fences and with the
+// language tag of the opening fence, if any. Joined, their contents are the original code.
+func splitCodeBlock(code string, limit int) []string {
+	open := codeFence
+	first, inner, _ := strings.Cut(strings.TrimSpace(code), "\n")
+	rest := strings.TrimPrefix(first, codeFence)
+	if codeLanguageRegex.MatchString(rest) {
+		open = first
+	} else if rest != "" {
+		// Text after the fence that isn't a language tag is the first line of the code.
+		inner = rest + "\n" + inner
+	}
+	inner = strings.TrimRight(strings.TrimSuffix(strings.TrimRight(inner, "\n"), codeFence), "\n")
+	wrap := utf8.RuneCountInString(open+"\n") + len("\n"+codeFence)
+	// splitBy only cuts inside a line when that single line is longer than a block: then it's
+	// cut hard where it reaches the limit, as there's no other way to fit it.
+	parts := splitBy(inner, limit-wrap, "\n")
+	for i, part := range parts {
+		parts[i] = open + "\n" + part + "\n" + codeFence
+	}
+	return parts
 }
 
 // splitBy splits text into pieces of at most limit characters, joining its parts separated

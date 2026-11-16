@@ -69,11 +69,10 @@ type ConvertedSlackMessage struct {
 
 // FallbackParts is the message as text in parts of at most matrixfmt.MaxSplitChars
 // characters, marked "(1/n)", "(2/n)"…, to send in order with FallbackSendReq if Slack
-// rejects SendReq. It's empty for messages without text, and fails with
-// matrixfmt.ErrCodeBlockTooLong if a code block doesn't fit in a part.
-func (conv *ConvertedSlackMessage) FallbackParts() ([]string, error) {
+// rejects SendReq. It's empty for messages without text.
+func (conv *ConvertedSlackMessage) FallbackParts() []string {
 	if conv.textFallback == nil {
-		return nil, nil
+		return nil
 	}
 	return matrixfmt.SplitText(conv.textFallback)
 }

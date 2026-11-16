@@ -138,13 +138,7 @@ func (s *SlackClient) sendToSlack(
 		_, timestamp, err := s.Client.PostMessageContext(ctx, channelID, conv.SendReq)
 		var rejection slack.SlackErrorResponse
 		if err != nil && errors.As(err, &rejection) {
-			parts, splitErr := conv.FallbackParts()
-			if splitErr != nil {
-				err = fmt.Errorf("slack rejected the message (%w) and it can't be split as text: %w", err, splitErr)
-				log.Err(err).Msg("Message failed for good")
-				return "", nil, definitiveFailure(err)
-			}
-			if len(parts) > 0 {
+			if parts := conv.FallbackParts(); len(parts) > 0 {
 				log.Warn().Err(err).Int("parts", len(parts)).Msg("Slack rejected the message, resending it as split text")
 				return s.sendSplitText(ctx, channelID, conv, parts, err)
 			}
