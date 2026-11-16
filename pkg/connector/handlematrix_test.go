@@ -266,3 +266,14 @@ func TestSendToSlackDoesNotResendOnTransportErrors(t *testing.T) {
 		t.Fatalf("expected one failed request, got %d requests, err %v", requests, err)
 	}
 }
+
+func TestRecoverSplitTurnsPanicIntoDefinitiveFailure(t *testing.T) {
+	parts, err := recoverSplit(func() []string { panic("slice bounds out of range") })
+	if err == nil || parts != nil || !strings.Contains(err.Error(), "slice bounds") {
+		t.Fatalf("expected the panic as an error, got %v, %v", parts, err)
+	}
+	var status bridgev2.MessageStatus
+	if !errors.As(definitiveFailure(err), &status) || status.Status != event.MessageStatusFail {
+		t.Fatalf("expected a definitive failure, got %#v", definitiveFailure(err))
+	}
+}

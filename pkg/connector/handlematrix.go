@@ -138,7 +138,13 @@ func (s *SlackClient) sendToSlack(
 		_, timestamp, err := s.Client.PostMessageContext(ctx, channelID, conv.SendReq)
 		var rejection slack.SlackErrorResponse
 		if err != nil && errors.As(err, &rejection) {
-			if parts := conv.FallbackParts(); len(parts) > 0 {
+			parts, splitErr := recoverSplit(conv.FallbackParts)
+			if splitErr != nil {
+				err = fmt.Errorf("slack rejected the message (%w) and splitting it as text failed: %w", err, splitErr)
+				log.Err(err).Msg("Message failed for good")
+				return "", nil, definitiveFailure(err)
+			}
+			if len(parts) > 0 {
 				log.Warn().Err(err).Int("parts", len(parts)).Msg("Slack rejected the message, resending it as split text")
 				return s.sendSplitText(ctx, channelID, conv, parts, err)
 			}
@@ -180,6 +186,17 @@ func (s *SlackClient) sendToSlack(
 	} else {
 		return "", nil, errors.New("no message or attachment to send")
 	}
+}
+
+// recoverSplit runs split and turns a panic in it into an error, so that a bug in the
+// split text fails the message for good instead of losing it without a trace.
+func recoverSplit(split func() []string) (parts []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic splitting the message as text: %v", r)
+		}
+	}()
+	return split(), nil
 }
 
 // sendSplitText sends the parts of a message that Slack rejected, in order, and returns the

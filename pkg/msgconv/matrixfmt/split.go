@@ -170,7 +170,10 @@ func splitCodeBlock(code string, limit int) []string {
 	open := codeFence
 	first, inner, _ := strings.Cut(strings.TrimSpace(code), "\n")
 	rest := strings.TrimPrefix(first, codeFence)
-	if codeLanguageRegex.MatchString(rest) {
+	// A tag that would leave less than half a part for the code isn't a language tag: it's
+	// kept as the first line of the code instead of being repeated on every block.
+	tagFits := utf8.RuneCountInString(first) <= limit/2
+	if codeLanguageRegex.MatchString(rest) && tagFits {
 		open = first
 	} else if rest != "" {
 		// Text after the fence that isn't a language tag is the first line of the code.
@@ -230,7 +233,10 @@ func splitBy(text string, limit int, seps ...string) []string {
 	return out
 }
 
+// hardCut cuts text every limit characters. A limit below 1 is taken as 1, so that it
+// never slices with a negative bound.
 func hardCut(text string, limit int) []string {
+	limit = max(limit, 1)
 	var out []string
 	runes := []rune(text)
 	for len(runes) > limit {

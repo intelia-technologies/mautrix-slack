@@ -181,3 +181,25 @@ func TestSplitShortMessageIsOnePartWithoutMarker(t *testing.T) {
 		t.Fatalf("an empty message should have no parts, got %q", chunks)
 	}
 }
+
+func TestSplitHugeLanguageTagDoesNotPanic(t *testing.T) {
+	// The input of the verifier: a fence with a tag of 3,500 characters, a line and the close.
+	tag := strings.Repeat("a", 3500)
+	chunks := SplitText(New2(nil, nil).ParseText(context.Background(), "```"+tag+"\nx\n```", nil, nil))
+	requireChunkSizes(t, chunks)
+	var all strings.Builder
+	for i := range chunks {
+		all.WriteString(stripMarker(t, chunks, i))
+	}
+	if strings.Count(all.String(), "a") != len(tag) || !strings.Contains(all.String(), "\nx\n") {
+		t.Fatalf("content lost: %d of %d characters of the tag", strings.Count(all.String(), "a"), len(tag))
+	}
+}
+
+func TestHardCutWithoutRoomDoesNotPanic(t *testing.T) {
+	for _, limit := range []int{0, -5} {
+		if got := hardCut("abc", limit); strings.Join(got, "") != "abc" {
+			t.Fatalf("hardCut(%d) lost text: %q", limit, got)
+		}
+	}
+}
