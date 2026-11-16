@@ -21,14 +21,17 @@ import (
 	"go.mau.fi/mautrix-slack/pkg/slackid"
 )
 
-// fakeSlack answers chat.postMessage with the given errors in order ("" is a success), then
-// with success. Each success has a new timestamp, ending in the number of the request.
+// fakeSlack answers each request with the given errors in order ("" is a success), then
+// with success. Each success has a new timestamp, ending in the number of the request. The
+// method of each request is recorded as "_method" in its form.
 func fakeSlack(t *testing.T, errs ...string) (*slack.Client, *[]url.Values) {
 	t.Helper()
 	var sent []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		sent = append(sent, r.PostForm)
+		form := r.PostForm
+		form.Set("_method", strings.TrimPrefix(r.URL.Path, "/"))
+		sent = append(sent, form)
 		if len(sent) <= len(errs) && errs[len(sent)-1] != "" {
 			_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, errs[len(sent)-1])
 			return
@@ -41,6 +44,11 @@ func fakeSlack(t *testing.T, errs ...string) (*slack.Client, *[]url.Values) {
 
 func convert(t *testing.T, formattedBody string, threadRoot *database.Message) *msgconv.ConvertedSlackMessage {
 	t.Helper()
+	return convertMessage(t, formattedBody, threadRoot, nil)
+}
+
+func convertMessage(t *testing.T, formattedBody string, threadRoot, editTarget *database.Message) *msgconv.ConvertedSlackMessage {
+	t.Helper()
 	mc := &msgconv.MessageConverter{MatrixHTMLParser: matrixfmt.New2(nil, nil)}
 	content := &event.MessageEventContent{
 		MsgType:       event.MsgText,
@@ -48,11 +56,68 @@ func convert(t *testing.T, formattedBody string, threadRoot *database.Message) *
 		Format:        event.FormatHTML,
 		FormattedBody: formattedBody,
 	}
-	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, threadRoot, nil, nil, false)
+	conv, err := mc.ToSlack(context.Background(), nil, nil, content, &event.Event{Type: event.EventMessage}, threadRoot, editTarget, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return conv
+}
+
+func TestSendToSlackSplitTextStartsAThread(t *testing.T) {
+	// A message that wasn't a reply: the first part goes to the channel and the rest reply to it.
+	client, sent := fakeSlack(t, "foo_unknown")
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, reportTables(), nil), nil)
+	if err != nil || ts != "1700000000.000002" || len(otherParts) != len(*sent)-2 {
+		t.Fatalf("expected the split text to be sent, got %q, %v, %v", ts, otherParts, err)
+	}
+	parts := (*sent)[1:]
+	if parts[0].Has("thread_ts") {
+		t.Fatalf("the first part should start the thread, got thread_ts %q", parts[0].Get("thread_ts"))
+	}
+	for i, part := range parts[1:] {
+		if part.Get("thread_ts") != ts {
+			t.Fatalf("part %d should reply to the first part %s, got thread_ts %q", i+2, ts, part.Get("thread_ts"))
+		}
+	}
+}
+
+func TestSendToSlackLongEditSplitsText(t *testing.T) {
+	// An edit that Slack rejects and doesn't fit in a part: the edited message gets the first
+	// part and the rest reply to it, so nothing of the new content is lost.
+	client, sent := fakeSlack(t, "foo_unknown")
+	editTarget := &database.Message{ID: slackid.MakeMessageID("T1", "C1", "1700000000.000200")}
+	ts, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convertMessage(t, reportTables(), nil, editTarget), nil)
+	if err != nil || ts != "1700000000.000002" {
+		t.Fatalf("expected the split edit to be sent, got %q, %v", ts, err)
+	}
+	parts := (*sent)[1:]
+	if len(parts) < 2 || len(otherParts) != len(parts)-1 {
+		t.Fatalf("expected several parts, got %d and %v", len(parts), otherParts)
+	}
+	first := parts[0]
+	if first.Get("_method") != "chat.update" || first.Get("ts") != "1700000000.000200" || first.Get("blocks") != "[]" ||
+		!strings.HasPrefix(first.Get("text"), fmt.Sprintf("(1/%d)\n", len(parts))) {
+		t.Fatalf("the first part should update the edited message, got %v", first)
+	}
+	for i, part := range parts[1:] {
+		if part.Get("_method") != "chat.postMessage" || part.Get("thread_ts") != "1700000000.000200" || part.Has("ts") {
+			t.Fatalf("part %d should reply to the edited message, got %v", i+2, part)
+		}
+	}
+}
+
+func TestSendToSlackCodeBlockTooLongFailsForGood(t *testing.T) {
+	// A code block of 4,000 characters doesn't fit in a part and isn't cut: the message fails.
+	client, sent := fakeSlack(t, "foo_unknown")
+	html := "<p>Antes</p><pre><code>" + strings.Repeat("x", 4000) + "</code></pre>"
+	_, otherParts, err := (&SlackClient{Client: client}).sendToSlack(context.Background(), "C1", convert(t, html, nil), nil)
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) || status.Status != event.MessageStatusFail || !errors.Is(err, matrixfmt.ErrCodeBlockTooLong) {
+		t.Fatalf("expected a definitive failure for the code block, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "foo_unknown") || len(*sent) != 1 || len(otherParts) != 0 {
+		t.Fatalf("expected no text sent after the rejection, got %d requests, %v", len(*sent), err)
+	}
 }
 
 const smallTable = `<p>Antes</p><table><tr><th>A</th></tr><tr><td>1</td></tr></table>`

@@ -2,6 +2,7 @@ package matrixfmt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -41,7 +42,7 @@ func TestSplit12000CharactersKeepsCodeBlocks(t *testing.T) {
 		}
 	}
 	block := New2(nil, nil).Parse(context.Background(), buf.String(), nil, nil)
-	chunks := SplitText(block)
+	chunks := mustSplit(t, block)
 	if len(chunks) < 4 {
 		t.Fatalf("expected at least 4 parts for 12000 characters, got %d", len(chunks))
 	}
@@ -72,7 +73,7 @@ func TestSplit12000CharactersKeepsCodeBlocks(t *testing.T) {
 func TestSplitPlainTextKeepsFencedCode(t *testing.T) {
 	code := "```\n" + strings.Repeat("x := 1\n", 300) + "```"
 	text := strings.Repeat("Una frase de un párrafo largo. ", 100) + "\n\n" + code + "\n\nFin."
-	chunks := SplitText(New2(nil, nil).ParseText(context.Background(), text, nil, nil))
+	chunks := mustSplit(t, New2(nil, nil).ParseText(context.Background(), text, nil, nil))
 	requireChunkSizes(t, chunks)
 	found := false
 	for i := range chunks {
@@ -87,8 +88,8 @@ func TestSplitPlainTextKeepsFencedCode(t *testing.T) {
 func TestSplitPlainTextOneLineFenceIsNotABlock(t *testing.T) {
 	// A one-line block doesn't open a code block, and text after an opening fence is code.
 	text := "```inline code```\n" + strings.Repeat("Prosa larga. ", 400) + "\n```\nreal\n```\n\n```primera linea\n" +
-		strings.Repeat("codigo\n", 600) + "```"
-	chunks := SplitText(New2(nil, nil).ParseText(context.Background(), text, nil, nil))
+		strings.Repeat("codigo\n", 300) + "```"
+	chunks := mustSplit(t, New2(nil, nil).ParseText(context.Background(), text, nil, nil))
 	requireChunkSizes(t, chunks)
 	var all strings.Builder
 	for i := range chunks {
@@ -98,43 +99,53 @@ func TestSplitPlainTextOneLineFenceIsNotABlock(t *testing.T) {
 		}
 		all.WriteString(body)
 	}
-	for _, want := range []string{"```inline code```", "```\nreal\n```", "```\nprimera linea\ncodigo"} {
+	for _, want := range []string{"```inline code```", "```\nreal\n```", "```primera linea\ncodigo"} {
 		if !strings.Contains(all.String(), want) {
 			t.Fatalf("lost %q", want)
 		}
 	}
 }
 
-func TestSplitCodeBlockLongerThanAPart(t *testing.T) {
-	var lines []string
-	for i := range 400 {
-		lines = append(lines, fmt.Sprintf("linea %03d de un bloque de codigo enorme", i))
+func TestSplitCodeBlockLongerThanAPartFails(t *testing.T) {
+	code := func(n int) *slack.RichTextBlock {
+		return slack.NewRichTextBlock("", slack.NewRichTextSection(slack.NewRichTextSectionTextElement(strings.Repeat("Antes ", 20), nil)),
+			slack.NewRichTextPreformatted(0, "", slack.NewRichTextSectionTextElement(strings.Repeat("x", n), nil)))
 	}
-	block := slack.NewRichTextBlock("", slack.NewRichTextPreformatted(0, "", slack.NewRichTextSectionTextElement(strings.Join(lines, "\n"), nil)))
-	chunks := SplitText(block)
+	// 4,000 characters of code can't go whole in a part: it isn't cut, the split fails.
+	if chunks, err := SplitText(code(4000)); !errors.Is(err, ErrCodeBlockTooLong) {
+		t.Fatalf("expected ErrCodeBlockTooLong, got %d parts, %v", len(chunks), err)
+	}
+	// A plain-text fenced block too.
+	fenced := New2(nil, nil).ParseText(context.Background(), "Antes\n\n```\n"+strings.Repeat("y\n", 2000)+"```", nil, nil)
+	if _, err := SplitText(fenced); !errors.Is(err, ErrCodeBlockTooLong) {
+		t.Fatalf("expected ErrCodeBlockTooLong for a fenced block, got %v", err)
+	}
+	// At the edge: a code block that fits in a part with its marker goes whole, in its own part.
+	chunks := mustSplit(t, code(MaxSplitChars-16))
 	requireChunkSizes(t, chunks)
-	var got []string
-	for i := range chunks {
-		body := stripMarker(t, chunks, i)
-		if !strings.HasPrefix(body, "```\n") || !strings.HasSuffix(body, "\n```") {
-			t.Fatalf("part %d isn't a complete code block: %.40q", i+1, body)
-		}
-		got = append(got, strings.TrimSuffix(strings.TrimPrefix(body, "```\n"), "\n```"))
-	}
-	if strings.Join(got, "\n") != strings.Join(lines, "\n") {
-		t.Fatal("the code block lost or reordered lines")
+	if len(chunks) != 2 || chunks[1] != "(2/2)\n```\n"+strings.Repeat("x", MaxSplitChars-16)+"\n```" {
+		t.Fatalf("expected the code block whole in part 2, got %d parts", len(chunks))
 	}
 }
 
 func TestSplitShortMessageIsOnePartWithoutMarker(t *testing.T) {
 	block := New2(nil, nil).Parse(context.Background(), `<h3>Título</h3><p>Hola <b>equipo</b> &amp; <a href="https://example.com">web</a></p>`+
 		`<ol start="3"><li>uno</li><li>dos</li></ol><blockquote>cita</blockquote>`, nil, nil)
-	chunks := SplitText(block)
+	chunks := mustSplit(t, block)
 	want := "*### Título*\nHola *equipo* &amp; <https://example.com|web>\n3. uno\n4. dos\n> cita"
 	if len(chunks) != 1 || chunks[0] != want {
 		t.Fatalf("got %q, want %q", chunks, want)
 	}
-	if chunks := SplitText(slack.NewRichTextBlock("")); len(chunks) != 0 {
+	if chunks := mustSplit(t, slack.NewRichTextBlock("")); len(chunks) != 0 {
 		t.Fatalf("an empty message should have no parts, got %q", chunks)
 	}
+}
+
+func mustSplit(t *testing.T, block *slack.RichTextBlock) []string {
+	t.Helper()
+	chunks, err := SplitText(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return chunks
 }
